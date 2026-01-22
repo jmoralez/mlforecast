@@ -394,19 +394,12 @@ class TimeSeries:
 
         # target
         self.max_horizon = max_horizon
-        if max_horizon is None:
-            target = self.ga.data
-        else:
-            target = self.ga.expand_target(max_horizon)
+        target = self.ga.data
         if self._restore_idxs is not None:
             target = target[self._restore_idxs]
 
         # determine rows to keep
         target_nulls = np.isnan(target)
-        if target_nulls.ndim == 2:
-            # target nulls for each horizon are dropped in MLForecast.fit_models
-            # we just drop rows here for which all the target values are null
-            target_nulls = target_nulls.all(axis=1)
         if dropna:
             feature_nulls = np.full(df.shape[0], False)
             for feature_vals in features.values():
@@ -487,25 +480,49 @@ class TimeSeries:
                 df = df.join(feats, on=self.time_col, how="left")
 
         # assemble return
-        if return_X_y:
-            if self.weight_col is not None:
-                x_cols = [self.weight_col, *self.features_order_]
-            else:
-                x_cols = self.features_order_
-            X = df[x_cols]
-            if as_numpy:
-                X = ufp.to_numpy(X)
-            return X, target
-        if max_horizon is not None:
-            # remove original target
-            out_cols = [c for c in df.columns if c != self.target_col]
-            df = df[out_cols]
-            target_names = [f"{self.target_col}{i}" for i in range(max_horizon)]
-            df = ufp.assign_columns(df, target_names, target)
-        else:
+        if self.max_horizon is None:
+            if return_X_y:
+                if self.weight_col is not None:
+                    x_cols = [self.weight_col, *self.features_order_]
+                else:
+                    x_cols = self.features_order_
+                X = df[x_cols]
+                if as_numpy:
+                    X = ufp.to_numpy(X)
+                return X, target
             df = ufp.copy_if_pandas(df, deep=False)
             df = ufp.assign_columns(df, self.target_col, target)
-        return df
+            return df
+
+        def my_iter():
+            dynamic_exogs = [
+                c
+                for c in self.features_order_
+                if c not in {*self.static_features_.columns, *self.transforms.keys()}
+            ]
+            moving_cols = [*dynamic_exogs, self.target_col]
+            moving_df = df[[self.id_col, self.time_col, *moving_cols]]
+            for i in range(self.max_horizon):
+                step_df = ufp.drop_columns(df, moving_cols)
+                step_df = ufp.assign_columns(
+                    step_df,
+                    self.time_col,
+                    ufp.offset_times(df[self.time_col], self.freq, i + 1),
+                )
+                step_df = ufp.join(step_df, moving_df, on=[self.id_col, self.time_col])
+                if return_X_y:
+                    if self.weight_col is not None:
+                        x_cols = [self.weight_col, *self.features_order_]
+                    else:
+                        x_cols = self.features_order_
+                    X = step_df[x_cols]
+                    if as_numpy:
+                        X = ufp.to_numpy(X)
+                    yield X, step_df[self.target_col].to_numpy()
+                else:
+                    yield step_df
+
+        return my_iter()
 
     def fit_transform(
         self,
